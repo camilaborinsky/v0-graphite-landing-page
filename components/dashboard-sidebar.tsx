@@ -1,9 +1,10 @@
 "use client";
 
 import { useState } from "react";
-import { Calendar, Building2, ChevronDown, ChevronRight } from "lucide-react";
+import { Calendar, Building2, ChevronDown, ChevronRight, Plus, Upload } from "lucide-react";
 import type { Event } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { Button } from "@/components/ui/button";
 
 interface DashboardSidebarProps {
   events: Event[];
@@ -12,6 +13,8 @@ interface DashboardSidebarProps {
   portfolio: string[];
   isOpen: boolean;
   onToggle: () => void;
+  onCreateEvent: () => void;
+  onUploadPortfolio: () => void;
 }
 
 export function DashboardSidebar({
@@ -21,6 +24,8 @@ export function DashboardSidebar({
   portfolio,
   isOpen,
   onToggle,
+  onCreateEvent,
+  onUploadPortfolio,
 }: DashboardSidebarProps) {
   const [eventsExpanded, setEventsExpanded] = useState(true);
   const [portfolioExpanded, setPortfolioExpanded] = useState(true);
@@ -62,23 +67,37 @@ export function DashboardSidebar({
 
             {eventsExpanded && (
               <div className="space-y-1">
-                {events.map((event) => (
-                  <button
-                    key={event.id}
-                    onClick={() => onSelectEvent(event.id)}
-                    className={cn(
-                      "w-full text-left px-3 py-2 rounded-lg text-sm transition-colors",
-                      selectedEventId === event.id
-                        ? "bg-[#3B82F6]/10 text-[#3B82F6] font-medium"
-                        : "text-neutral-700 hover:bg-neutral-100"
-                    )}
-                  >
-                    <p className="font-medium truncate">{event.name}</p>
-                    <p className="text-xs text-neutral-500">
-                      {event.date} · {event.attendeeCount} attendees
-                    </p>
-                  </button>
-                ))}
+                {events.length === 0 ? (
+                  <p className="text-sm text-neutral-400 px-3 py-2">No events yet</p>
+                ) : (
+                  events.map((event) => (
+                    <button
+                      key={event.id}
+                      onClick={() => onSelectEvent(event.id)}
+                      className={cn(
+                        "w-full text-left px-3 py-2 rounded-lg text-sm transition-colors",
+                        selectedEventId === event.id
+                          ? "bg-[#3B82F6]/10 text-[#3B82F6] font-medium"
+                          : "text-neutral-700 hover:bg-neutral-100"
+                      )}
+                    >
+                      <p className="font-medium truncate">{event.name}</p>
+                      <p className="text-xs text-neutral-500">
+                        {event.date} · {event.attendeeCount} attendees
+                      </p>
+                    </button>
+                  ))
+                )}
+                
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={onCreateEvent}
+                  className="w-full justify-start text-[#3B82F6] hover:text-[#2563EB] hover:bg-[#3B82F6]/5 mt-2"
+                >
+                  <Plus className="w-4 h-4 mr-2" />
+                  Create Event
+                </Button>
               </div>
             )}
           </div>
@@ -102,15 +121,29 @@ export function DashboardSidebar({
 
             {portfolioExpanded && (
               <div className="space-y-1">
-                {portfolio.map((company) => (
-                  <div
-                    key={company}
-                    className="px-3 py-2 text-sm text-neutral-700 flex items-center gap-2"
-                  >
-                    <div className="w-2 h-2 rounded-sm bg-[#10B981]" />
-                    {company}
-                  </div>
-                ))}
+                {portfolio.length === 0 ? (
+                  <p className="text-sm text-neutral-400 px-3 py-2">No companies yet</p>
+                ) : (
+                  portfolio.map((company) => (
+                    <div
+                      key={company}
+                      className="px-3 py-2 text-sm text-neutral-700 flex items-center gap-2"
+                    >
+                      <div className="w-2 h-2 rounded-sm bg-[#10B981]" />
+                      {company}
+                    </div>
+                  ))
+                )}
+                
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={onUploadPortfolio}
+                  className="w-full justify-start text-[#3B82F6] hover:text-[#2563EB] hover:bg-[#3B82F6]/5 mt-2"
+                >
+                  <Upload className="w-4 h-4 mr-2" />
+                  Upload Portfolio
+                </Button>
               </div>
             )}
           </div>

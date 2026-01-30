@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getRecommendations } from "@/lib/demo-data";
+import { getRecommendations } from "@/lib/data-store";
 
 export async function GET(
   request: Request,
@@ -9,6 +9,6 @@ export async function GET(
   const { searchParams } = new URL(request.url);
   const vcId = searchParams.get("vcId") || "vc-1";
   
-  const recommendations = getRecommendations(eventId, vcId);
+  const recommendations = await getRecommendations(eventId, vcId);
   return NextResponse.json(recommendations);
 }
