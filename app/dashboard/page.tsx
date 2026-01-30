@@ -5,12 +5,13 @@ import { useRouter } from "next/navigation";
 import { Search } from "lucide-react";
 import useSWR from "swr";
 import { useAuth } from "@/lib/auth-context";
-import { getPortfolio } from "@/lib/demo-data";
 import { DashboardHeader } from "@/components/dashboard-header";
 import { DashboardSidebar } from "@/components/dashboard-sidebar";
 import { ForceGraph } from "@/components/force-graph";
 import { RecommendationsPanel } from "@/components/recommendations-panel";
 import { PersonModal } from "@/components/person-modal";
+import { UploadPortfolioModal } from "@/components/upload-portfolio-modal";
+import { CreateEventModal } from "@/components/create-event-modal";
 import { Input } from "@/components/ui/input";
 import type { Event, GraphData, Recommendation, GraphNode } from "@/lib/types";
 
@@ -24,6 +25,8 @@ export default function DashboardPage() {
   const [highlightedNodeId, setHighlightedNodeId] = useState<string | null>(null);
   const [selectedPersonId, setSelectedPersonId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
+  const [showPortfolioModal, setShowPortfolioModal] = useState(false);
+  const [showEventModal, setShowEventModal] = useState(false);
 
   // Redirect if not logged in
   useEffect(() => {
@@ -33,7 +36,13 @@ export default function DashboardPage() {
   }, [user, authLoading, router]);
 
   // Fetch events
-  const { data: events } = useSWR<Event[]>("/api/events", fetcher);
+  const { data: events, mutate: mutateEvents } = useSWR<Event[]>("/api/events", fetcher);
+
+  // Fetch portfolio
+  const { data: portfolio, mutate: mutatePortfolio } = useSWR<string[]>(
+    user ? `/api/portfolio?userId=${user.id}` : null,
+    fetcher
+  );
 
   // Select first event by default
   useEffect(() => {
@@ -43,18 +52,17 @@ export default function DashboardPage() {
   }, [events, selectedEventId]);
 
   // Fetch graph data
-  const { data: graphData } = useSWR<GraphData>(
+  const { data: graphData, mutate: mutateGraph } = useSWR<GraphData>(
     selectedEventId && user ? `/api/events/${selectedEventId}/graph?vcId=${user.id}` : null,
     fetcher
   );
 
   // Fetch recommendations
-  const { data: recommendations } = useSWR<Recommendation[]>(
+  const { data: recommendations, mutate: mutateRecommendations } = useSWR<Recommendation[]>(
     selectedEventId && user ? `/api/events/${selectedEventId}/recommendations?vcId=${user.id}` : null,
     fetcher
   );
 
-  const portfolio = user ? getPortfolio(user.id) : [];
   const selectedEvent = events?.find((e) => e.id === selectedEventId);
 
   const handleNodeClick = useCallback((node: GraphNode) => {
@@ -69,6 +77,22 @@ export default function DashboardPage() {
     setHighlightedNodeId(personId);
     setSelectedPersonId(personId);
   }, []);
+
+  const handlePortfolioSuccess = useCallback(() => {
+    setShowPortfolioModal(false);
+    mutatePortfolio();
+    mutateGraph();
+    mutateRecommendations();
+  }, [mutatePortfolio, mutateGraph, mutateRecommendations]);
+
+  const handleEventSuccess = useCallback(() => {
+    setShowEventModal(false);
+    mutateEvents().then((newEvents) => {
+      if (newEvents && newEvents.length > 0) {
+        setSelectedEventId(newEvents[newEvents.length - 1].id);
+      }
+    });
+  }, [mutateEvents]);
 
   if (authLoading || !user) {
     return (
@@ -87,9 +111,11 @@ export default function DashboardPage() {
           events={events || []}
           selectedEventId={selectedEventId}
           onSelectEvent={setSelectedEventId}
-          portfolio={portfolio}
+          portfolio={portfolio || []}
           isOpen={sidebarOpen}
           onToggle={() => setSidebarOpen(false)}
+          onCreateEvent={() => setShowEventModal(true)}
+          onUploadPortfolio={() => setShowPortfolioModal(true)}
         />
 
         {/* Main content */}
@@ -120,18 +146,24 @@ export default function DashboardPage() {
               </div>
             </div>
 
-            {/* Graph */}
-            <div className="flex-1 min-h-[400px] rounded-lg border border-neutral-200 overflow-hidden">
-              {graphData ? (
+            {/* Graph or empty state */}
+            <div className="flex-1 min-h-[400px] rounded-lg border border-neutral-200 overflow-hidden bg-white">
+              {graphData && graphData.nodes.length > 0 ? (
                 <ForceGraph
                   data={graphData}
                   onNodeClick={handleNodeClick}
                   highlightedNodeId={highlightedNodeId}
                   searchQuery={searchQuery}
                 />
+              ) : selectedEvent ? (
+                <div className="w-full h-full flex flex-col items-center justify-center text-neutral-400 p-8">
+                  <p className="text-lg mb-2">No attendees in this event yet</p>
+                  <p className="text-sm">Upload attendees to see the network graph</p>
+                </div>
               ) : (
-                <div className="w-full h-full flex items-center justify-center text-neutral-400">
-                  Select an event to view the network
+                <div className="w-full h-full flex flex-col items-center justify-center text-neutral-400 p-8">
+                  <p className="text-lg mb-2">No events yet</p>
+                  <p className="text-sm">Create an event and upload attendees to get started</p>
                 </div>
               )}
             </div>
@@ -150,8 +182,23 @@ export default function DashboardPage() {
       {/* Person modal */}
       <PersonModal
         personId={selectedPersonId}
-        portfolio={portfolio}
+        portfolio={portfolio || []}
         onClose={() => setSelectedPersonId(null)}
+      />
+
+      {/* Upload portfolio modal */}
+      <UploadPortfolioModal
+        open={showPortfolioModal}
+        onClose={() => setShowPortfolioModal(false)}
+        userId={user.id}
+        onSuccess={handlePortfolioSuccess}
+      />
+
+      {/* Create event modal */}
+      <CreateEventModal
+        open={showEventModal}
+        onClose={() => setShowEventModal(false)}
+        onSuccess={handleEventSuccess}
       />
     </div>
   );
