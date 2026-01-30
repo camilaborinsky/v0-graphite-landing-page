@@ -278,40 +278,24 @@ export async function getEventGraph(
   eventId: string,
   userId: string
 ): Promise<GraphData> {
-  // Get portfolio companies for this user
+  // Get portfolio companies for this user to mark target companies
   const portfolio = await getPortfolio(userId);
   const portfolioSet = new Set(portfolio);
 
-  // Get all persons attending the event with their companies
-  const personResults = await runQuery<{
-    personId: string;
-    personName: string;
-    personTitle: string;
-    companyName: string;
-    relType: string;
+  // Get ALL nodes and relationships from Neo4j
+  const allData = await runQuery<{
+    n: { labels: string[]; properties: Record<string, unknown> };
+    r: { type: string; startNodeElementId: string; endNodeElementId: string } | null;
+    startNode: { labels: string[]; properties: Record<string, unknown> } | null;
+    endNode: { labels: string[]; properties: Record<string, unknown> } | null;
   }>(
     `
-    MATCH (p:Person)-[:ATTENDS]->(e:Event {id: $eventId})
-    OPTIONAL MATCH (p)-[r:WORKS_AT|WORKED_AT]->(c:Company)
-    RETURN p.id as personId, p.name as personName, p.title as personTitle,
-           c.name as companyName, type(r) as relType
-    `,
-    { eventId }
-  );
-
-  // Get connections between attendees
-  const connectionResults = await runQuery<{
-    person1Id: string;
-    person2Id: string;
-  }>(
+    MATCH (n)
+    OPTIONAL MATCH (n)-[r]->(m)
+    RETURN n, r, 
+           CASE WHEN r IS NOT NULL THEN startNode(r) END as startNode,
+           CASE WHEN r IS NOT NULL THEN endNode(r) END as endNode
     `
-    MATCH (p1:Person)-[:ATTENDS]->(e:Event {id: $eventId})
-    MATCH (p2:Person)-[:ATTENDS]->(e)
-    MATCH (p1)-[:CONNECTED_TO]-(p2)
-    WHERE p1.id < p2.id
-    RETURN p1.id as person1Id, p2.id as person2Id
-    `,
-    { eventId }
   );
 
   const nodes: GraphData["nodes"] = [];
@@ -319,54 +303,73 @@ export async function getEventGraph(
   const addedNodes = new Set<string>();
   const addedLinks = new Set<string>();
 
-  // Process persons and their company relationships
-  for (const row of personResults) {
-    // Add person node
-    if (!addedNodes.has(row.personId)) {
-      nodes.push({
-        id: row.personId,
-        name: row.personName,
-        type: "person",
-        title: row.personTitle,
-      });
-      addedNodes.add(row.personId);
+  // Process all nodes
+  for (const row of allData) {
+    const nodeProps = row.n.properties;
+    const labels = row.n.labels || [];
+    const nodeId = (nodeProps.id as string) || (nodeProps.name as string) || `node-${addedNodes.size}`;
+    
+    if (!addedNodes.has(nodeId)) {
+      if (labels.includes("Person")) {
+        nodes.push({
+          id: nodeId,
+          name: (nodeProps.name as string) || "Unknown",
+          type: "person",
+          title: (nodeProps.title as string) || "",
+        });
+      } else if (labels.includes("Company")) {
+        const companyName = (nodeProps.name as string) || "Unknown";
+        nodes.push({
+          id: `company-${companyName}`,
+          name: companyName,
+          type: "company",
+          isTarget: portfolioSet.has(companyName),
+        });
+      } else if (labels.includes("Event")) {
+        nodes.push({
+          id: nodeId,
+          name: (nodeProps.name as string) || "Event",
+          type: "event" as "person" | "company",
+        });
+      } else if (labels.includes("User")) {
+        nodes.push({
+          id: nodeId,
+          name: (nodeProps.id as string) || "User",
+          type: "user" as "person" | "company",
+        });
+      }
+      addedNodes.add(nodeId);
     }
 
-    // Add company node and link
-    if (row.companyName) {
-      const companyId = `company-${row.companyName}`;
-      if (!addedNodes.has(companyId)) {
-        nodes.push({
-          id: companyId,
-          name: row.companyName,
-          type: "company",
-          isTarget: portfolioSet.has(row.companyName),
-        });
-        addedNodes.add(companyId);
+    // Process relationships
+    if (row.r && row.startNode && row.endNode) {
+      const startProps = row.startNode.properties;
+      const endProps = row.endNode.properties;
+      const startLabels = row.startNode.labels || [];
+      const endLabels = row.endNode.labels || [];
+      
+      let sourceId = (startProps.id as string) || (startProps.name as string);
+      let targetId = (endProps.id as string) || (endProps.name as string);
+      
+      // Adjust IDs for companies
+      if (startLabels.includes("Company")) {
+        sourceId = `company-${startProps.name}`;
       }
-
-      const linkKey = `${row.personId}-${companyId}-${row.relType}`;
-      if (!addedLinks.has(linkKey)) {
+      if (endLabels.includes("Company")) {
+        targetId = `company-${endProps.name}`;
+      }
+      
+      const relType = row.r.type;
+      const linkKey = `${sourceId}-${targetId}-${relType}`;
+      
+      if (sourceId && targetId && !addedLinks.has(linkKey)) {
         links.push({
-          source: row.personId,
-          target: companyId,
-          type: row.relType as "WORKS_AT" | "WORKED_AT",
+          source: sourceId,
+          target: targetId,
+          type: relType as "WORKS_AT" | "WORKED_AT" | "CONNECTED_TO",
         });
         addedLinks.add(linkKey);
       }
-    }
-  }
-
-  // Add person-to-person connections
-  for (const conn of connectionResults) {
-    const linkKey = `${conn.person1Id}-${conn.person2Id}-CONNECTED_TO`;
-    if (!addedLinks.has(linkKey)) {
-      links.push({
-        source: conn.person1Id,
-        target: conn.person2Id,
-        type: "CONNECTED_TO",
-      });
-      addedLinks.add(linkKey);
     }
   }
 
