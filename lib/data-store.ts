@@ -1,245 +1,567 @@
 "use server";
 
-import type { Event, GraphData, Person, Recommendation, PersonWithHistory, WorkHistory } from "./types";
+import { runQuery } from "./neo4j";
+import type {
+  Event,
+  GraphData,
+  Person,
+  Recommendation,
+  PersonWithHistory,
+  WorkHistory,
+} from "./types";
 
-// In-memory store (persists during server runtime)
-// In production, this would be replaced with Neo4j queries
+// Portfolio management - Companies the VC wants to track
+export async function setPortfolio(
+  userId: string,
+  companies: string[]
+): Promise<void> {
+  // First, remove existing portfolio relationships
+  await runQuery(
+    `
+    MATCH (u:User {id: $userId})-[r:HAS_IN_PORTFOLIO]->(c:Company)
+    DELETE r
+    `,
+    { userId }
+  );
 
-interface StoredPerson extends Person {
-  workHistory: { company: string; title: string; from: string; to?: string }[];
-}
+  // Ensure user exists
+  await runQuery(
+    `
+    MERGE (u:User {id: $userId})
+    RETURN u
+    `,
+    { userId }
+  );
 
-interface DataStore {
-  portfolios: Map<string, string[]>;
-  events: Map<string, Event>;
-  eventAttendees: Map<string, string[]>;
-  people: Map<string, StoredPerson>;
-  connections: [string, string][];
-}
-
-// Global store
-const store: DataStore = {
-  portfolios: new Map(),
-  events: new Map(),
-  eventAttendees: new Map(),
-  people: new Map(),
-  connections: [],
-};
-
-// Portfolio management
-export async function setPortfolio(userId: string, companies: string[]): Promise<void> {
-  store.portfolios.set(userId, companies);
+  // Create companies and relationships
+  for (const companyName of companies) {
+    await runQuery(
+      `
+      MERGE (c:Company {name: $companyName})
+      WITH c
+      MATCH (u:User {id: $userId})
+      MERGE (u)-[:HAS_IN_PORTFOLIO]->(c)
+      `,
+      { userId, companyName }
+    );
+  }
 }
 
 export async function getPortfolio(userId: string): Promise<string[]> {
-  return store.portfolios.get(userId) || [];
+  const result = await runQuery<{ name: string }>(
+    `
+    MATCH (u:User {id: $userId})-[:HAS_IN_PORTFOLIO]->(c:Company)
+    RETURN c.name as name
+    `,
+    { userId }
+  );
+  return result.map((r) => r.name);
 }
 
-export async function addCompanyToPortfolio(userId: string, company: string): Promise<void> {
-  const portfolio = store.portfolios.get(userId) || [];
-  if (!portfolio.includes(company)) {
-    portfolio.push(company);
-    store.portfolios.set(userId, portfolio);
-  }
+export async function addCompanyToPortfolio(
+  userId: string,
+  company: string
+): Promise<void> {
+  await runQuery(
+    `
+    MERGE (u:User {id: $userId})
+    MERGE (c:Company {name: $company})
+    MERGE (u)-[:HAS_IN_PORTFOLIO]->(c)
+    `,
+    { userId, company }
+  );
 }
 
 // Event management
 export async function createEvent(event: Event): Promise<void> {
-  store.events.set(event.id, event);
-  store.eventAttendees.set(event.id, []);
+  await runQuery(
+    `
+    CREATE (e:Event {
+      id: $id,
+      name: $name,
+      date: $date,
+      attendeeCount: $attendeeCount
+    })
+    `,
+    {
+      id: event.id,
+      name: event.name,
+      date: event.date,
+      attendeeCount: event.attendeeCount,
+    }
+  );
 }
 
 export async function getEvents(): Promise<Event[]> {
-  return Array.from(store.events.values());
+  const result = await runQuery<{
+    id: string;
+    name: string;
+    date: string;
+    attendeeCount: number;
+  }>(
+    `
+    MATCH (e:Event)
+    OPTIONAL MATCH (p:Person)-[:ATTENDS]->(e)
+    WITH e, count(p) as actualCount
+    RETURN e.id as id, e.name as name, e.date as date, 
+           CASE WHEN actualCount > 0 THEN actualCount ELSE e.attendeeCount END as attendeeCount
+    ORDER BY e.date DESC
+    `
+  );
+  return result.map((r) => ({
+    id: r.id,
+    name: r.name,
+    date: r.date,
+    attendeeCount: typeof r.attendeeCount === 'object' 
+      ? (r.attendeeCount as { low: number }).low 
+      : r.attendeeCount,
+  }));
 }
 
 export async function getEvent(eventId: string): Promise<Event | undefined> {
-  return store.events.get(eventId);
+  const result = await runQuery<{
+    id: string;
+    name: string;
+    date: string;
+    attendeeCount: number;
+  }>(
+    `
+    MATCH (e:Event {id: $eventId})
+    OPTIONAL MATCH (p:Person)-[:ATTENDS]->(e)
+    WITH e, count(p) as actualCount
+    RETURN e.id as id, e.name as name, e.date as date,
+           CASE WHEN actualCount > 0 THEN actualCount ELSE e.attendeeCount END as attendeeCount
+    `,
+    { eventId }
+  );
+  if (result.length === 0) return undefined;
+  const r = result[0];
+  return {
+    id: r.id,
+    name: r.name,
+    date: r.date,
+    attendeeCount: typeof r.attendeeCount === 'object' 
+      ? (r.attendeeCount as { low: number }).low 
+      : r.attendeeCount,
+  };
 }
 
 export async function deleteEvent(eventId: string): Promise<void> {
-  store.events.delete(eventId);
-  store.eventAttendees.delete(eventId);
+  await runQuery(
+    `
+    MATCH (e:Event {id: $eventId})
+    OPTIONAL MATCH (p:Person)-[r:ATTENDS]->(e)
+    DELETE r, e
+    `,
+    { eventId }
+  );
 }
 
 // Attendee management
-export async function addAttendeesToEvent(eventId: string, attendees: StoredPerson[]): Promise<void> {
-  const attendeeIds: string[] = [];
-  
+interface AttendeeInput {
+  id: string;
+  name: string;
+  title: string;
+  currentCompany: string;
+  workHistory?: { company: string; title: string; from: string; to?: string }[];
+}
+
+export async function addAttendeesToEvent(
+  eventId: string,
+  attendees: AttendeeInput[]
+): Promise<void> {
   for (const attendee of attendees) {
-    store.people.set(attendee.id, attendee);
-    attendeeIds.push(attendee.id);
-  }
-  
-  const existing = store.eventAttendees.get(eventId) || [];
-  store.eventAttendees.set(eventId, [...existing, ...attendeeIds]);
-  
-  // Update event attendee count
-  const event = store.events.get(eventId);
-  if (event) {
-    event.attendeeCount = (store.eventAttendees.get(eventId) || []).length;
-    store.events.set(eventId, event);
-  }
-}
-
-// Connection management
-export async function addConnection(person1Id: string, person2Id: string): Promise<void> {
-  const exists = store.connections.some(
-    ([p1, p2]) => (p1 === person1Id && p2 === person2Id) || (p1 === person2Id && p2 === person1Id)
-  );
-  if (!exists) {
-    store.connections.push([person1Id, person2Id]);
-  }
-}
-
-// Graph generation
-export async function getEventGraph(eventId: string, userId: string): Promise<GraphData> {
-  const attendeeIds = store.eventAttendees.get(eventId) || [];
-  const attendees = attendeeIds
-    .map((id) => store.people.get(id))
-    .filter((p): p is StoredPerson => p !== undefined);
-  const portfolio = await getPortfolio(userId);
-  
-  const nodes: GraphData["nodes"] = [];
-  const links: GraphData["links"] = [];
-  const companySet = new Set<string>();
-  
-  // Add person nodes and collect companies
-  for (const person of attendees) {
-    nodes.push({
-      id: person.id,
-      name: person.name,
-      type: "person",
-      title: person.title,
-      photoUrl: person.photoUrl,
-    });
-    
-    // Current company
-    if (person.currentCompany) {
-      companySet.add(person.currentCompany);
-      links.push({
-        source: person.id,
-        target: `company-${person.currentCompany}`,
-        type: "WORKS_AT",
-      });
-    }
-    
-    // Past companies
-    for (const work of person.workHistory || []) {
-      if (work.to) {
-        companySet.add(work.company);
-        links.push({
-          source: person.id,
-          target: `company-${work.company}`,
-          type: "WORKED_AT",
-        });
+    // Create person node
+    await runQuery(
+      `
+      MERGE (p:Person {id: $id})
+      SET p.name = $name, p.title = $title, p.currentCompany = $currentCompany
+      `,
+      {
+        id: attendee.id,
+        name: attendee.name,
+        title: attendee.title,
+        currentCompany: attendee.currentCompany,
       }
-    }
-  }
-  
-  // Add company nodes
-  for (const company of companySet) {
-    nodes.push({
-      id: `company-${company}`,
-      name: company,
-      type: "company",
-      isTarget: portfolio.includes(company),
-    });
-  }
-  
-  // Add person-to-person connections
-  for (const [p1, p2] of store.connections) {
-    if (attendeeIds.includes(p1) && attendeeIds.includes(p2)) {
-      links.push({
-        source: p1,
-        target: p2,
-        type: "CONNECTED_TO",
-      });
-    }
-  }
-  
-  return { nodes, links };
-}
+    );
 
-// Recommendations
-export async function getRecommendations(eventId: string, userId: string): Promise<Recommendation[]> {
-  const attendeeIds = store.eventAttendees.get(eventId) || [];
-  const attendees = attendeeIds
-    .map((id) => store.people.get(id))
-    .filter((p): p is StoredPerson => p !== undefined);
-  const portfolio = await getPortfolio(userId);
-  const recommendations: Recommendation[] = [];
-  
-  for (const person of attendees) {
-    // Check if currently works at target
-    if (portfolio.includes(person.currentCompany)) {
-      recommendations.push({
-        person: { id: person.id, name: person.name, title: person.title, currentCompany: person.currentCompany },
-        reason: `Works at ${person.currentCompany}`,
-        reasonType: "works_at_target",
-        targetCompany: person.currentCompany,
-      });
-      continue;
+    // Create ATTENDS relationship to event
+    await runQuery(
+      `
+      MATCH (p:Person {id: $personId})
+      MATCH (e:Event {id: $eventId})
+      MERGE (p)-[:ATTENDS]->(e)
+      `,
+      { personId: attendee.id, eventId }
+    );
+
+    // Create current company and WORKS_AT relationship
+    if (attendee.currentCompany) {
+      await runQuery(
+        `
+        MERGE (c:Company {name: $companyName})
+        WITH c
+        MATCH (p:Person {id: $personId})
+        MERGE (p)-[:WORKS_AT]->(c)
+        `,
+        { personId: attendee.id, companyName: attendee.currentCompany }
+      );
     }
-    
-    // Check if formerly worked at target
-    const formerTarget = (person.workHistory || []).find((w) => w.to && portfolio.includes(w.company));
-    if (formerTarget) {
-      recommendations.push({
-        person: { id: person.id, name: person.name, title: person.title, currentCompany: person.currentCompany },
-        reason: `Former ${formerTarget.company}`,
-        reasonType: "former_target",
-        targetCompany: formerTarget.company,
-      });
-      continue;
-    }
-    
-    // Check if connected to someone at target
-    for (const [p1, p2] of store.connections) {
-      const connectedId = p1 === person.id ? p2 : p2 === person.id ? p1 : null;
-      if (connectedId && attendeeIds.includes(connectedId)) {
-        const connectedPerson = store.people.get(connectedId);
-        if (connectedPerson && portfolio.includes(connectedPerson.currentCompany)) {
-          recommendations.push({
-            person: { id: person.id, name: person.name, title: person.title, currentCompany: person.currentCompany },
-            reason: `Connected to ${connectedPerson.name} at ${connectedPerson.currentCompany}`,
-            reasonType: "connected_to_target",
-            targetCompany: connectedPerson.currentCompany,
-            connectedPerson: connectedPerson.name,
-          });
-          break;
+
+    // Create work history relationships
+    if (attendee.workHistory) {
+      for (const work of attendee.workHistory) {
+        if (work.to) {
+          // Past job
+          await runQuery(
+            `
+            MERGE (c:Company {name: $companyName})
+            WITH c
+            MATCH (p:Person {id: $personId})
+            MERGE (p)-[r:WORKED_AT]->(c)
+            SET r.title = $title, r.from = $from, r.to = $to
+            `,
+            {
+              personId: attendee.id,
+              companyName: work.company,
+              title: work.title,
+              from: work.from,
+              to: work.to,
+            }
+          );
         }
       }
     }
   }
-  
-  // Sort: works_at_target first, then former_target, then connected
-  const order = { works_at_target: 0, former_target: 1, connected_to_target: 2 };
-  return recommendations.sort((a, b) => order[a.reasonType] - order[b.reasonType]);
+
+  // Update event attendee count
+  await runQuery(
+    `
+    MATCH (e:Event {id: $eventId})
+    OPTIONAL MATCH (p:Person)-[:ATTENDS]->(e)
+    WITH e, count(p) as cnt
+    SET e.attendeeCount = cnt
+    `,
+    { eventId }
+  );
+
+  // Auto-detect connections: people who worked at the same company
+  await runQuery(
+    `
+    MATCH (p1:Person)-[:ATTENDS]->(e:Event {id: $eventId})
+    MATCH (p2:Person)-[:ATTENDS]->(e)
+    WHERE p1.id < p2.id
+    MATCH (p1)-[:WORKS_AT|WORKED_AT]->(c:Company)<-[:WORKS_AT|WORKED_AT]-(p2)
+    MERGE (p1)-[:CONNECTED_TO]-(p2)
+    `,
+    { eventId }
+  );
 }
 
-// Person details
-export async function getPerson(personId: string): Promise<PersonWithHistory | null> {
-  const person = store.people.get(personId);
-  if (!person) return null;
-  
-  const workHistory: WorkHistory[] = (person.workHistory || []).map((w) => ({
+// Connection management
+export async function addConnection(
+  person1Id: string,
+  person2Id: string
+): Promise<void> {
+  await runQuery(
+    `
+    MATCH (p1:Person {id: $person1Id})
+    MATCH (p2:Person {id: $person2Id})
+    MERGE (p1)-[:CONNECTED_TO]-(p2)
+    `,
+    { person1Id, person2Id }
+  );
+}
+
+// Graph generation for visualization
+export async function getEventGraph(
+  eventId: string,
+  userId: string
+): Promise<GraphData> {
+  // Get portfolio companies for this user
+  const portfolio = await getPortfolio(userId);
+  const portfolioSet = new Set(portfolio);
+
+  // Get all persons attending the event with their companies
+  const personResults = await runQuery<{
+    personId: string;
+    personName: string;
+    personTitle: string;
+    companyName: string;
+    relType: string;
+  }>(
+    `
+    MATCH (p:Person)-[:ATTENDS]->(e:Event {id: $eventId})
+    OPTIONAL MATCH (p)-[r:WORKS_AT|WORKED_AT]->(c:Company)
+    RETURN p.id as personId, p.name as personName, p.title as personTitle,
+           c.name as companyName, type(r) as relType
+    `,
+    { eventId }
+  );
+
+  // Get connections between attendees
+  const connectionResults = await runQuery<{
+    person1Id: string;
+    person2Id: string;
+  }>(
+    `
+    MATCH (p1:Person)-[:ATTENDS]->(e:Event {id: $eventId})
+    MATCH (p2:Person)-[:ATTENDS]->(e)
+    MATCH (p1)-[:CONNECTED_TO]-(p2)
+    WHERE p1.id < p2.id
+    RETURN p1.id as person1Id, p2.id as person2Id
+    `,
+    { eventId }
+  );
+
+  const nodes: GraphData["nodes"] = [];
+  const links: GraphData["links"] = [];
+  const addedNodes = new Set<string>();
+  const addedLinks = new Set<string>();
+
+  // Process persons and their company relationships
+  for (const row of personResults) {
+    // Add person node
+    if (!addedNodes.has(row.personId)) {
+      nodes.push({
+        id: row.personId,
+        name: row.personName,
+        type: "person",
+        title: row.personTitle,
+      });
+      addedNodes.add(row.personId);
+    }
+
+    // Add company node and link
+    if (row.companyName) {
+      const companyId = `company-${row.companyName}`;
+      if (!addedNodes.has(companyId)) {
+        nodes.push({
+          id: companyId,
+          name: row.companyName,
+          type: "company",
+          isTarget: portfolioSet.has(row.companyName),
+        });
+        addedNodes.add(companyId);
+      }
+
+      const linkKey = `${row.personId}-${companyId}-${row.relType}`;
+      if (!addedLinks.has(linkKey)) {
+        links.push({
+          source: row.personId,
+          target: companyId,
+          type: row.relType as "WORKS_AT" | "WORKED_AT",
+        });
+        addedLinks.add(linkKey);
+      }
+    }
+  }
+
+  // Add person-to-person connections
+  for (const conn of connectionResults) {
+    const linkKey = `${conn.person1Id}-${conn.person2Id}-CONNECTED_TO`;
+    if (!addedLinks.has(linkKey)) {
+      links.push({
+        source: conn.person1Id,
+        target: conn.person2Id,
+        type: "CONNECTED_TO",
+      });
+      addedLinks.add(linkKey);
+    }
+  }
+
+  return { nodes, links };
+}
+
+// Recommendations - who to meet at this event
+export async function getRecommendations(
+  eventId: string,
+  userId: string
+): Promise<Recommendation[]> {
+  const portfolio = await getPortfolio(userId);
+  if (portfolio.length === 0) return [];
+
+  const recommendations: Recommendation[] = [];
+  const addedPersons = new Set<string>();
+
+  // 1. People who currently work at portfolio companies
+  const worksAtResults = await runQuery<{
+    personId: string;
+    personName: string;
+    personTitle: string;
+    companyName: string;
+  }>(
+    `
+    MATCH (p:Person)-[:ATTENDS]->(e:Event {id: $eventId})
+    MATCH (p)-[:WORKS_AT]->(c:Company)
+    WHERE c.name IN $portfolio
+    RETURN p.id as personId, p.name as personName, p.title as personTitle, c.name as companyName
+    `,
+    { eventId, portfolio }
+  );
+
+  for (const row of worksAtResults) {
+    if (!addedPersons.has(row.personId)) {
+      recommendations.push({
+        person: {
+          id: row.personId,
+          name: row.personName,
+          title: row.personTitle,
+          currentCompany: row.companyName,
+        },
+        reason: `Works at ${row.companyName}`,
+        reasonType: "works_at_target",
+        targetCompany: row.companyName,
+      });
+      addedPersons.add(row.personId);
+    }
+  }
+
+  // 2. People who formerly worked at portfolio companies
+  const workedAtResults = await runQuery<{
+    personId: string;
+    personName: string;
+    personTitle: string;
+    currentCompany: string;
+    formerCompany: string;
+  }>(
+    `
+    MATCH (p:Person)-[:ATTENDS]->(e:Event {id: $eventId})
+    MATCH (p)-[:WORKED_AT]->(c:Company)
+    WHERE c.name IN $portfolio
+    RETURN p.id as personId, p.name as personName, p.title as personTitle, 
+           p.currentCompany as currentCompany, c.name as formerCompany
+    `,
+    { eventId, portfolio }
+  );
+
+  for (const row of workedAtResults) {
+    if (!addedPersons.has(row.personId)) {
+      recommendations.push({
+        person: {
+          id: row.personId,
+          name: row.personName,
+          title: row.personTitle,
+          currentCompany: row.currentCompany,
+        },
+        reason: `Former ${row.formerCompany}`,
+        reasonType: "former_target",
+        targetCompany: row.formerCompany,
+      });
+      addedPersons.add(row.personId);
+    }
+  }
+
+  // 3. People connected to someone at a portfolio company
+  const connectedResults = await runQuery<{
+    personId: string;
+    personName: string;
+    personTitle: string;
+    currentCompany: string;
+    connectedPersonName: string;
+    targetCompany: string;
+  }>(
+    `
+    MATCH (p:Person)-[:ATTENDS]->(e:Event {id: $eventId})
+    MATCH (p)-[:CONNECTED_TO]-(other:Person)-[:WORKS_AT]->(c:Company)
+    WHERE c.name IN $portfolio
+    RETURN p.id as personId, p.name as personName, p.title as personTitle,
+           p.currentCompany as currentCompany, other.name as connectedPersonName, c.name as targetCompany
+    `,
+    { eventId, portfolio }
+  );
+
+  for (const row of connectedResults) {
+    if (!addedPersons.has(row.personId)) {
+      recommendations.push({
+        person: {
+          id: row.personId,
+          name: row.personName,
+          title: row.personTitle,
+          currentCompany: row.currentCompany,
+        },
+        reason: `Connected to ${row.connectedPersonName} at ${row.targetCompany}`,
+        reasonType: "connected_to_target",
+        targetCompany: row.targetCompany,
+        connectedPerson: row.connectedPersonName,
+      });
+      addedPersons.add(row.personId);
+    }
+  }
+
+  return recommendations;
+}
+
+// Person details with work history
+export async function getPerson(
+  personId: string
+): Promise<PersonWithHistory | null> {
+  // Get person basic info
+  const personResult = await runQuery<{
+    id: string;
+    name: string;
+    title: string;
+    currentCompany: string;
+  }>(
+    `
+    MATCH (p:Person {id: $personId})
+    RETURN p.id as id, p.name as name, p.title as title, p.currentCompany as currentCompany
+    `,
+    { personId }
+  );
+
+  if (personResult.length === 0) return null;
+  const person = personResult[0];
+
+  // Get work history
+  const workHistoryResult = await runQuery<{
+    company: string;
+    title: string;
+    from: string;
+    to: string | null;
+    isCurrent: boolean;
+  }>(
+    `
+    MATCH (p:Person {id: $personId})-[r:WORKS_AT|WORKED_AT]->(c:Company)
+    RETURN c.name as company, 
+           COALESCE(r.title, p.title) as title,
+           COALESCE(r.from, '2020') as from,
+           r.to as to,
+           type(r) = 'WORKS_AT' as isCurrent
+    ORDER BY isCurrent DESC, r.from DESC
+    `,
+    { personId }
+  );
+
+  const workHistory: WorkHistory[] = workHistoryResult.map((w) => ({
     company: w.company,
     title: w.title,
     from: w.from,
-    to: w.to,
-    isCurrent: !w.to,
+    to: w.to || undefined,
+    isCurrent: w.isCurrent,
   }));
-  
-  const connectionIds = store.connections
-    .filter(([p1, p2]) => p1 === personId || p2 === personId)
-    .map(([p1, p2]) => (p1 === personId ? p2 : p1));
-  
-  const connections = connectionIds
-    .map((id) => store.people.get(id))
-    .filter((p): p is StoredPerson => p !== undefined)
-    .map((p) => ({ id: p.id, name: p.name, title: p.title, currentCompany: p.currentCompany }));
-  
+
+  // Get connections
+  const connectionsResult = await runQuery<{
+    id: string;
+    name: string;
+    title: string;
+    currentCompany: string;
+  }>(
+    `
+    MATCH (p:Person {id: $personId})-[:CONNECTED_TO]-(other:Person)
+    RETURN other.id as id, other.name as name, other.title as title, other.currentCompany as currentCompany
+    `,
+    { personId }
+  );
+
+  const connections: Person[] = connectionsResult.map((c) => ({
+    id: c.id,
+    name: c.name,
+    title: c.title,
+    currentCompany: c.currentCompany,
+  }));
+
   return {
     id: person.id,
     name: person.name,
@@ -251,9 +573,32 @@ export async function getPerson(personId: string): Promise<PersonWithHistory | n
   };
 }
 
-// Check if user has data
+// Check if user has any data
 export async function hasUserData(userId: string): Promise<boolean> {
-  const portfolio = store.portfolios.get(userId);
-  const events = Array.from(store.events.values());
-  return (portfolio && portfolio.length > 0) || events.length > 0;
+  const portfolioResult = await runQuery<{ count: number }>(
+    `
+    MATCH (u:User {id: $userId})-[:HAS_IN_PORTFOLIO]->(c:Company)
+    RETURN count(c) as count
+    `,
+    { userId }
+  );
+
+  const eventsResult = await runQuery<{ count: number }>(
+    `
+    MATCH (e:Event)
+    RETURN count(e) as count
+    `
+  );
+
+  const portfolioCount = portfolioResult[0]?.count || 0;
+  const eventsCount = eventsResult[0]?.count || 0;
+
+  const pCount = typeof portfolioCount === 'object' 
+    ? (portfolioCount as unknown as { low: number }).low 
+    : portfolioCount;
+  const eCount = typeof eventsCount === 'object' 
+    ? (eventsCount as unknown as { low: number }).low 
+    : eventsCount;
+
+  return pCount > 0 || eCount > 0;
 }
